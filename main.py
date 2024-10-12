@@ -1,5 +1,5 @@
-from userDistanceGraph import *
-from pre import *
+from letterboxdpy import user
+from pre import findCompatibility
 
 uname1 = input("enter name 1 : ")
 uname2 = input("enter name 2 : ")
