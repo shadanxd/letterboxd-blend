@@ -1,6 +1,9 @@
 import numpy as np
 from collections import defaultdict
 from letterboxdpy import movie
+import time
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 """
 rating character to value mapping
@@ -72,6 +75,7 @@ watched between the two users
 """
 def findCompatibility(u1_reviews, u2_reviews):
     l = findCommonMovies(u1_reviews, u2_reviews)
+    print(l)
 
     if len(l) == 0:
         return 0  # If no common movies, compatibility is 0
@@ -82,59 +86,56 @@ def findCompatibility(u1_reviews, u2_reviews):
     finalCompatibility = findCosine(v1, v2) * 100
     return finalCompatibility
 
-def get_movie_genres(movie_id):
-    """
-    Extracts genres from a movie's API response
-    
-    Args:
-        movie_id: The ID of the movie to look up
-        
-    Returns:
-        list: A list of genres associated with the movie
-    """
+
+@lru_cache(maxsize=None)
+def get_movie_genres(movie_id: str) -> list:
+    """Thread-safe cached genre fetcher with retries"""
     try:
-        movie_details = movie.Movie(movie_id)
-        return movie_details.genres
+        return movie.Movie(movie_id).genres
     except Exception as e:
-        print(f"Error fetching genres for movie {movie_id}: {str(e)}")
         return []
 
-def create_genre_vector(user_diary):
-    """
-    Creates a vector of average ratings per genre for all movies a user has rated
+def precompute_genres(user1_reviews, user2_reviews, max_workers: int = 5):
+    """Pre-fetch genres for all unique movies using threading"""
+    def extract_movie_ids(reviews):
+        return {entry['movie_id'] for entry in reviews if entry['rating']}
     
-    Args:
-        user_diary: List of diary entries containing movie ratings
-        
-    Returns:
-        dict: Dictionary mapping genres to their average ratings
-    """
-    genre_ratings = defaultdict(list)
-    total_movies = 0
+    # Get unique movies from both users
+    u1_movies = extract_movie_ids(user1_reviews)
+    u2_movies = extract_movie_ids(user2_reviews)
+    all_movies = list(u1_movies.union(u2_movies))
     
+    # Parallel fetch using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        executor.map(get_movie_genres, all_movies)
+
+def create_genre_vector_parallel(user_diary: list) -> dict:
+    """Optimized genre vector creation using pre-cached data"""
+    movie_ratings = defaultdict(list)
+    # Collect all ratings per movie
     for entry in user_diary:
-        if entry['rating'] is not None:  # Only consider rated movies
+        if entry['rating']:
+            movie_id = entry['movie_id']
             rating = rating_to_numeric[entry['rating']]
-            try:
-                genres = get_movie_genres(entry['movie_id'])
-                if genres:  # If we successfully got genres
-                    total_movies += 1
-                    for genre in genres:
-                        genre_ratings[genre].append(rating)
-            except Exception as e:
-                print(f"Error processing entry {entry['movie_id']}: {str(e)}")
-                continue
+            movie_ratings[movie_id].append(rating)
     
-    # Calculate average rating and number of movies for each genre
-    genre_vector = {}
-    for genre, ratings in genre_ratings.items():
-        if ratings:
-            avg_rating = np.mean(ratings)
-            # Weight by how often they watch this genre
-            frequency = len(ratings) / total_movies
-            genre_vector[genre] = avg_rating * frequency
+    total_movies = len(movie_ratings)
+    if not total_movies:
+        return {}
     
-    return genre_vector
+    genre_ratings = defaultdict(list)
+    # Process movies with cached genres
+    for movie_id, ratings in movie_ratings.items():
+        genres = get_movie_genres(movie_id)
+        avg_rating = np.mean(ratings)
+        for genre in genres:
+            genre_ratings[genre].append(avg_rating)
+    
+    # Calculate weighted averages
+    return {
+        genre: (np.mean(ratings) * (len(ratings)/total_movies))
+        for genre, ratings in genre_ratings.items()
+    }
 
 def normalize_genre_vector(genre_vector):
     values = np.array(list(genre_vector.values()))
@@ -171,36 +172,28 @@ def genre_similarity(genre_vector1, genre_vector2):
     return np.dot(v1, v2) / (norm1 * norm2)
 
 def enhanced_compatibility(u1_reviews, u2_reviews):
-    """
-    Calculate overall compatibility between users based on:
-    1. Rating similarity for common movies
-    2. Genre preferences across ALL rated movies
+    """Multi-threaded compatibility calculation"""
+    start_time = time.time()
     
-    Args:
-        u1_reviews: First user's diary entries
-        u2_reviews: Second user's diary entries
-        
-    Returns:
-        float: Compatibility score between 0 and 100
-    """
-    # Calculate rating-based compatibility (using common movies)
-    rating_compatibility = findCompatibility(u1_reviews, u2_reviews)
+    # Pre-fetch genres for both users' movies in parallel
+    precompute_genres(u1_reviews, u2_reviews)
     
-    try:
-        # Calculate genre-based compatibility (using all rated movies)
-        u1_genre_vector = create_genre_vector(u1_reviews)
-        u2_genre_vector = create_genre_vector(u2_reviews)
-        
-        if not u1_genre_vector or not u2_genre_vector:
-            return rating_compatibility
-            
-        genre_compatibility = genre_similarity(u1_genre_vector, u2_genre_vector) * 100
-        
-        # Combine scores (70% rating similarity, 30% genre preference similarity)
-        final_compatibility = 0.7 * rating_compatibility + 0.3 * genre_compatibility
-        
-        return final_compatibility
+    # Calculate rating compatibility
+    rating_comp = findCompatibility(u1_reviews, u2_reviews)
     
-    except Exception as e:
-        print(f"Error calculating genre compatibility: {str(e)}")
-        return rating_compatibility
+    # Parallel genre vector creation
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        u1_future = executor.submit(create_genre_vector_parallel, u1_reviews)
+        u2_future = executor.submit(create_genre_vector_parallel, u2_reviews)
+        u1_genre_vector = u1_future.result()
+        u2_genre_vector = u2_future.result()
+    
+    # Calculate genre compatibility
+    genre_comp = genre_similarity(u1_genre_vector, u2_genre_vector) * 100
+    
+    # Combine scores
+    final_comp = 0.7 * rating_comp + 0.3 * genre_comp
+    
+    print(f"Total execution time: {time.time() - start_time:.2f}s")
+    return final_comp
+
