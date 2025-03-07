@@ -1,5 +1,5 @@
 from letterboxdpy import user
-from pre import findCompatibility, enhanced_compatibility
+from pre import enhanced_compatibility
 
 uname1 = input("enter name 1 : ")
 uname2 = input("enter name 2 : ")
